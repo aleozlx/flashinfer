@@ -1681,7 +1681,7 @@ def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> 
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [FP4Moe],
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe],
             },
             id="Renorm",
             marks=pytest.mark.skip(
@@ -1710,7 +1710,7 @@ def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> 
                 "n_groups": 0,
                 "top_k_groups": 0,
                 "routed_scaling": 2.5,
-                "has_routing_bias": False,
+                "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.Llama4,
                 "compatible_moe_impls": [FP8PerTensorMoe],
             },
