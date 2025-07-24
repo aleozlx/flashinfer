@@ -117,6 +117,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   }
 
   args.routing_logits = routing_logits.data_ptr();
+  auto const routing_bias_dtype =
+      routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::Float;
   if (routing_bias.has_value()) {
     args.routing_bias = routing_bias.value().data_ptr();
   } else {
@@ -152,9 +154,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
       {args.num_tokens * args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
   at::Tensor permuted_idx_to_token_idx = at::detail::empty_cuda(
       {max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-  at::Tensor expert_weights =
-      at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::BFloat16,
-                             routing_logits.device(), std::nullopt);
+  at::Tensor expert_weights = at::detail::empty_cuda(
+      {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
   at::Tensor expert_indexes = at::detail::empty_cuda(
       {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
   at::Tensor expert_count_histogram = at::detail::empty_cuda(
@@ -315,7 +316,7 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe(
 }
 
 at::Tensor trtllm_fp8_block_scale_moe_launcher(
-    at::Tensor const& routing_logits, at::Tensor const& routing_bias,
+    at::Tensor const& routing_logits, at::optional<at::Tensor> routing_bias,
     at::Tensor const& hidden_states, at::Tensor const& hidden_states_scale,
     at::Tensor const& gemm1_weights, at::Tensor const& gemm1_weights_scale,
     at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale,
@@ -345,11 +346,14 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
               "routing_logits and hidden_states must have the same number of tokens.");
   TORCH_CHECK(routing_logits.sizes()[1] == num_experts,
               "routing_logits dim1 must match num_experts.");
-  TORCH_CHECK(routing_bias.scalar_type() == at::ScalarType::BFloat16 ||
-                  routing_bias.scalar_type() == at::ScalarType::Float,
-              "routing_bias must be bfloat16 or float.");
-  TORCH_CHECK(routing_bias.dim() == 1, "routing_bias must be 1D.");
-  TORCH_CHECK(routing_bias.sizes()[0] == num_experts, "routing_bias has incorrect shape.");
+  if (routing_bias.has_value()) {
+    TORCH_CHECK(routing_bias.value().scalar_type() == at::ScalarType::BFloat16 ||
+                    routing_bias.value().scalar_type() == at::ScalarType::Float,
+                "routing_bias must be bfloat16 or float.");
+    TORCH_CHECK(routing_bias.value().dim() == 1, "routing_bias must be 1D.");
+    TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts,
+                "routing_bias has incorrect shape.");
+  }
 
   if (n_group <= 0 || topk_group <= 0) {
     TORCH_CHECK(top_k == 1, "Current routing kernel (no groups) only supports top_k=1.");
@@ -386,7 +390,13 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
                         ? batchedGemm::trtllm::gen::Dtype::Bfloat16
                         : batchedGemm::trtllm::gen::Dtype::Fp32;
   args.routing_logits = routing_logits.data_ptr<float>();
-  args.routing_bias = routing_bias.data_ptr();
+  auto const routing_bias_dtype =
+      routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
+  if (routing_bias.has_value()) {
+    args.routing_bias = routing_bias.value().data_ptr();
+  } else {
+    args.routing_bias = nullptr;
+  }
   args.hidden_states = hidden_states.data_ptr();
   args.hidden_states_scale = hidden_states_scale.data_ptr<float>();
   args.gemm1_weights = gemm1_weights.data_ptr();
@@ -417,9 +427,8 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
       {args.num_tokens * args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
   at::Tensor permuted_idx_to_token_idx = at::detail::empty_cuda(
       {max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-  at::Tensor expert_weights =
-      at::detail::empty_cuda({args.num_tokens, args.top_k}, routing_bias.scalar_type(),
-                             routing_logits.device(), std::nullopt);
+  at::Tensor expert_weights = at::detail::empty_cuda(
+      {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
   at::Tensor expert_indexes = at::detail::empty_cuda(
       {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
   int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
@@ -458,7 +467,7 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
   tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
   auto const& stream = at::cuda::getCurrentCUDAStream(routing_logits.get_device());
   routing_runner.run(
-      routing_logits.data_ptr<float>(), routing_bias.data_ptr(), args.num_tokens, args.num_experts,
+      routing_logits.data_ptr<float>(), args.routing_bias, args.num_tokens, args.num_experts,
       args.top_k, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
       args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
       expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
@@ -588,7 +597,7 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
 }
 
 at::Tensor trtllm_fp8_block_scale_moe(
-    at::Tensor const& routing_logits, at::Tensor const& routing_bias,
+    at::Tensor const& routing_logits, at::optional<at::Tensor> routing_bias,
     at::Tensor const& hidden_states, at::Tensor const& hidden_states_scale,
     at::Tensor const& gemm1_weights, at::Tensor const& gemm1_weights_scale,
     at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale, int64_t num_experts,
