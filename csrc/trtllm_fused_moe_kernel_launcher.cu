@@ -386,12 +386,12 @@ at::Tensor trtllm_fp8_block_scale_moe_launcher(
     TORCH_CHECK(false, "Unsupported input dtype for MoE: ", dtype);
   }
 
-  args.mDtypeExpW = routing_bias.scalar_type() == at::ScalarType::BFloat16
+  auto const routing_bias_dtype =
+      routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
+  args.mDtypeExpW = routing_bias_dtype == at::ScalarType::BFloat16
                         ? batchedGemm::trtllm::gen::Dtype::Bfloat16
                         : batchedGemm::trtllm::gen::Dtype::Fp32;
   args.routing_logits = routing_logits.data_ptr<float>();
-  auto const routing_bias_dtype =
-      routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
   if (routing_bias.has_value()) {
     args.routing_bias = routing_bias.value().data_ptr();
   } else {
