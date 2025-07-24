@@ -46,7 +46,7 @@ namespace flashinfer {
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 
 at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
-    at::Tensor const& routing_logits, optional<at::Tensor const&> routing_bias,
+    at::Tensor const& routing_logits, at::optional<at::Tensor const&> routing_bias,
     at::Tensor const& hidden_states, at::Tensor const& gemm1_weights,
     at::Tensor const& output1_scales_scalar, at::Tensor const& output1_scales_gate_scalar,
     at::Tensor const& gemm2_weights, at::Tensor const& output2_scales_scalar,
@@ -294,8 +294,8 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
 }
 
 at::Tensor trtllm_fp8_per_tensor_scale_moe(
-    at::Tensor routing_logits, optional<at::Tensor const&> routing_bias, at::Tensor hidden_states,
-    at::Tensor gemm1_weights, at::Tensor output1_scales_scalar,
+    at::Tensor routing_logits, at::optional<at::Tensor const&> routing_bias,
+    at::Tensor hidden_states, at::Tensor gemm1_weights, at::Tensor output1_scales_scalar,
     at::Tensor output1_scales_gate_scalar, at::Tensor gemm2_weights,
     at::Tensor output2_scales_scalar, int64_t num_experts, int64_t top_k, int64_t n_group,
     int64_t topk_group, int64_t intermediate_size, int64_t local_expert_offset,
