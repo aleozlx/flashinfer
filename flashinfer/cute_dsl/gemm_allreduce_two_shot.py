@@ -1356,7 +1356,10 @@ class PersistentDenseGemmKernel:
                             flag = barrier_flag.iterator + tile_id
                             # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
                             distributed.spin_lock_atom_cas_relaxed_wait(
-                                flag, expected_val=num_ranks, reset_val=0, scope="gpu"
+                                lock_ptr=flag,
+                                expected_val=num_ranks,
+                                reset_val=0,
+                                scope="gpu",
                             )
 
                     cute.arch.barrier(
