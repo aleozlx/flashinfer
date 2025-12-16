@@ -38,12 +38,20 @@ def sm_wise_inter_gpu_multimem_barrier(
     bidx, bidy, bidz = cute.arch.block_idx()
     bdimx, bdimy, _ = cute.arch.grid_dim()
     pid = bidx + bidy * bdimx + bidz * bdimx * bdimy
-    distributed.multimem_red_release_sys_add1(barrier_mc + pid, loc=loc, ip=ip)
+    # Use release-ordered multimem add instead of separate release operation
+    distributed.multimem_red_add1(
+        lock_ptr=barrier_mc + pid, scope="sys", order="release", loc=loc, ip=ip
+    )
     cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
 
-    # Use distributed module utilities for acquire semantics
-    distributed.spin_lock_atom_cas_acquire_wait(
-        barrier + pid, expected_val=num_ranks, reset_val=0, scope="sys", loc=loc, ip=ip
+    # Use relaxed wait - memory ordering is ensured by the release operation above
+    distributed.spin_lock_atom_cas_relaxed_wait(
+        lock_ptr=barrier + pid,
+        expected_val=num_ranks,
+        reset_val=0,
+        scope="sys",
+        loc=loc,
+        ip=ip,
     )
 
 
