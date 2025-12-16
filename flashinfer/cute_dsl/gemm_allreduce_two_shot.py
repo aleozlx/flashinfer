@@ -29,59 +29,6 @@ def spin_lock_multimem_arrive(lock_ptr: Pointer, loc=None, ip=None) -> None:
     distributed.multimem_red_relaxed_gpu_add1(lock_ptr, loc=loc, ip=ip)
 
 
-# HACK https://github.com/NVIDIA/cutlass/issues/2845
-from cutlass._mlir.dialects import nvvm
-from cutlass.cutlass_dsl import T
-from cutlass._mlir.dialects.nvvm import (
-    MemOrderKind,
-    MemScopeKind,
-    AtomicOpKind,
-)
-
-
-@cute.jit
-def spin_lock_atom_cas_acquire_wait(
-    lock_ptr: Pointer,
-    *,
-    expected_val: Int32,
-    reset_val: Int32,
-    scope: str,
-    loc=None,
-    ip=None,
-) -> None:
-    """
-    wait on a spin lock until the expected count is reached. Reset flag to reset_val if the expected count is reached.
-    """
-    if scope == "gpu":
-        result = 0
-        while result != expected_val:
-            result = nvvm.atomicrmw(
-                T.i32(),
-                AtomicOpKind.CAS,
-                lock_ptr.llvm_ptr,
-                Int32(reset_val).ir_value(loc=loc, ip=ip),
-                b=Int32(expected_val).ir_value(loc=loc, ip=ip),
-                mem_order=MemOrderKind.ACQUIRE,
-                syncscope=MemScopeKind.GPU,
-                loc=loc,
-                ip=ip,
-            )
-    elif scope == "sys":
-        result = 0
-        while result != expected_val:
-            result = nvvm.atomicrmw(
-                T.i32(),
-                AtomicOpKind.CAS,
-                lock_ptr.llvm_ptr,
-                Int32(reset_val).ir_value(loc=loc, ip=ip),
-                b=Int32(expected_val).ir_value(loc=loc, ip=ip),
-                mem_order=MemOrderKind.ACQUIRE,
-                syncscope=MemScopeKind.SYS,
-                loc=loc,
-                ip=ip,
-            )
-
-
 def sm_wise_inter_gpu_multimem_barrier(
     barrier: Pointer, barrier_mc: Pointer, num_ranks, loc=None, ip=None
 ) -> None:
@@ -91,13 +38,20 @@ def sm_wise_inter_gpu_multimem_barrier(
     bidx, bidy, bidz = cute.arch.block_idx()
     bdimx, bdimy, _ = cute.arch.grid_dim()
     pid = bidx + bidy * bdimx + bidz * bdimx * bdimy
-    distributed.multimem_red_release_sys_add1(barrier_mc + pid, loc=loc, ip=ip)
+    # Use release-ordered multimem add instead of separate release operation
+    distributed.multimem_red_add1(
+        lock_ptr=barrier_mc + pid, scope="sys", order="release", loc=loc, ip=ip
+    )
     cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
 
-    # v4.3.1 does not have mem_order="acquire" variant in `distributed` module
-    # filed issue https://github.com/NVIDIA/cutlass/issues/2845
-    spin_lock_atom_cas_acquire_wait(
-        barrier + pid, expected_val=num_ranks, reset_val=0, scope="sys", loc=loc, ip=ip
+    # Use relaxed wait - memory ordering is ensured by the release operation above
+    distributed.spin_lock_atom_cas_relaxed_wait(
+        lock_ptr=barrier + pid,
+        expected_val=num_ranks,
+        reset_val=0,
+        scope="sys",
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -1402,7 +1356,10 @@ class PersistentDenseGemmKernel:
                             flag = barrier_flag.iterator + tile_id
                             # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
                             distributed.spin_lock_atom_cas_relaxed_wait(
-                                flag, expected_val=num_ranks, reset_val=0, scope="gpu"
+                                lock_ptr=flag,
+                                expected_val=num_ranks,
+                                reset_val=0,
+                                scope="gpu",
                             )
 
                     cute.arch.barrier(
