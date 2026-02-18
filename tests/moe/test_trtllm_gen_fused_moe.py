@@ -2885,8 +2885,8 @@ def test_deepseekv3_routing(
 
 # Test: TopK routing
 @pytest.mark.parametrize("num_tokens", [8, 128])  # Limited for GeGlu
-@pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [384, 512, 768, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 3072])
+@pytest.mark.parametrize("intermediate_size", [384, 512, 768, 1024, 1536])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -2912,6 +2912,22 @@ def test_deepseekv3_routing(
                 "enable_autotune": True,
             },
             id="TopK",
+        ),
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 4,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopK,
+                "compatible_moe_impls": [FP4Moe],
+                "compatible_intermediate_size": [1536],
+                "enable_autotune": True,
+            },
+            id="NaN_repro",
         ),
     ],
 )
