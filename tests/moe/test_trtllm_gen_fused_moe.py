@@ -2699,7 +2699,7 @@ def test_renormalize_routing(
 # Test: DeepSeekV3 routing
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2944, 2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [2944, 2048, 1536, 1024, 768, 512, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [

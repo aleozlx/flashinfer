@@ -81,7 +81,7 @@ def skip_checks(
             f"Incompatible: {moe_impl.name} + {activation_type} + {routing_config['routing_method_type']} + {num_tokens}"
         )
     elif activation_type == ActivationType.Swiglu and (
-        hidden_size > 1024 or intermediate_size > 1024
+        hidden_size > 1024 or intermediate_size > 2048
     ):
         pytest.skip(
             f"Skip for testing speed: {activation_type} + {hidden_size} + {intermediate_size}"
