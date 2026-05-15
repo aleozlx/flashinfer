@@ -1557,7 +1557,7 @@ def get_trtllm_moe_sm100_module():
             output=output,
             routing_logits=routing_logits,
             topk_ids=topk_ids,
-            expert_weights=topk_weights,
+            expert_weights=expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=None,
             per_token_scale=None,
