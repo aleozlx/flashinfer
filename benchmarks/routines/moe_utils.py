@@ -39,6 +39,12 @@ from flashinfer.fused_moe import WeightLayout, convert_to_block_layout
 FLOAT8_E4M3_MAX = 448.0
 FLOAT4_E2M1_MAX = 6.0
 
+SF_VEC_SIZE = {
+    "nvfp4": 16,
+    "mxfp4": 32,
+    "mxfp8": 32,
+}
+
 
 def generate_moe_weights(
     num_experts: int,
@@ -113,7 +119,7 @@ def quantize_fp4(
         - block_scale_factors: float8_e4m3fn tensor
         - global_scale_factor: float32 scalar tensor
     """
-    sf_vec_size = 16
+    sf_vec_size = SF_VEC_SIZE["mxfp4" if use_ue8m0 else "nvfp4"]
 
     if global_scale is None:
         global_scale = calculate_fp4_global_scale(tensor)
@@ -460,13 +466,15 @@ def calculate_moe_tflops(
     num_experts: int,
     top_k: int,
     time_ms: float,
+    is_gated: bool = True,
 ) -> float:
     """
     Calculate TFLOPS for MOE operation.
 
     MOE computation involves:
-    1. First GEMM: [num_tokens, hidden_size] x [num_experts, hidden_size, 2*intermediate_size]
-    2. Activation function (SwiGLU gate)
+    1. First GEMM: [num_tokens, hidden_size] x [num_experts, hidden_size, w1_cols]
+       where w1_cols = 2*intermediate_size (gated) or intermediate_size (non-gated)
+    2. Activation function (SwiGLU gate or ReLU2)
     3. Second GEMM: [num_tokens, intermediate_size] x [num_experts, intermediate_size, hidden_size]
 
     For each token, we only compute for top_k experts.
@@ -478,6 +486,7 @@ def calculate_moe_tflops(
         num_experts: Total number of experts
         top_k: Number of experts per token
         time_ms: Execution time in milliseconds
+        is_gated: Whether activation is gated (SwiGLU/GeGLU) or non-gated (ReLU2)
 
     Returns:
         TFLOPS value
@@ -485,8 +494,9 @@ def calculate_moe_tflops(
     _ = num_experts  # kept for backward compatibility
 
     # FLOPS per token per expert
+    w1_cols = (2 if is_gated else 1) * intermediate_size
     flops_per_token_per_expert = (
-        2 * hidden_size * 2 * intermediate_size  # First GEMM
+        2 * hidden_size * w1_cols  # First GEMM
         + 2 * intermediate_size * hidden_size  # Second GEMM
     )
 
@@ -509,6 +519,7 @@ def calculate_moe_kernel_bandwidth(
     routing_logits_dtype: Optional[torch.dtype] = torch.float32,
     active_experts: Optional[int] = None,
     verbose: int = 0,
+    is_gated: bool = True,
 ) -> float:
     """
     Calculate memory bandwidth for MOE kernel operation in TB/sec.
@@ -537,11 +548,11 @@ def calculate_moe_kernel_bandwidth(
         dtype: torch.dtype, fmt: Optional[str], is_weight: bool = False
     ) -> float:
         if fmt == "nvfp4":
-            # 1 e4m3 + 1 e4m3 scale per 16-element block
-            return 0.5 + 1 / 16
+            return 0.5 + 1 / SF_VEC_SIZE["nvfp4"]
         elif fmt == "mxfp4":
-            # 1 e2m1 + 1 ue8m0 scale per 32-element block
-            return 0.5 + 1 / 32
+            return 0.5 + 1 / SF_VEC_SIZE["mxfp4"]
+        elif fmt == "mxfp8":
+            return 1.0 + 1 / SF_VEC_SIZE["mxfp8"]
         elif fmt == "fp8":
             # 1 e4m3
             return 1.0
@@ -567,8 +578,9 @@ def calculate_moe_kernel_bandwidth(
     )
 
     # Weight memory
+    w1_cols = (2 if is_gated else 1) * intermediate_size
     weight_bytes_per_expert = (
-        2 * intermediate_size * hidden_size * weight_bytes_per_element  # gemm1
+        w1_cols * hidden_size * weight_bytes_per_element  # gemm1
         + hidden_size * intermediate_size * weight_bytes_per_element  # gemm2
     )
     if active_experts is not None:
