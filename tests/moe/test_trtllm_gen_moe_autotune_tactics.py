@@ -426,6 +426,132 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
     )
 
 
+def test_nvfp4_per_tensor_large_shape_tile128_repro_4168():
+    """Regression repro for issue #4168: IMA crash from biasFp32M cubin at tile_N=128.
+
+    Root cause: pre-fix TrtllmGenBatchedGemmRunner had no mDtypeSfC check, so cubins
+    with E2m1 output but FP32 per-token scale factors (e.g. ``biasFp32M`` variants) were
+    selected.  These cubins write 4-byte FP32 data into the uint8 gemm1_output_scale
+    buffer (sized for E4M3/1-byte elements) → 4x buffer overflow → async IMA.
+
+    Shape: num_tokens=256, hidden=intermediate=7168, num_experts=16, top_k=8
+    → avg = 256 * 8 / 16 = 128 tokens/expert → tile_N=128 is the center config,
+    which is the size tier where biasFp32M cubins from the old ``b368d003`` package live.
+
+    Expected behaviour:
+    * **Pre-fix** (before ``873edfba`` on release / ``a34a735b`` on main):
+      getValidConfigs returns biasFp32M tile_N=128 cubins; running them causes
+      an async CUDA IMA that surfaces at the next ``torch.cuda.synchronize()``.
+    * **Post-fix** (rc5 = ``463c164c``):
+      mDtypeSfC check filters out biasFp32M cubins; all valid tactics pass cleanly.
+    """
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103 (B200).")
+
+    AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
+
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    num_tokens = 256
+    hidden_size = intermediate_size = 7168
+    num_experts = 16
+    top_k = 8
+    avg = num_tokens * top_k // num_experts  # 128
+
+    inputs = _build_fp4_routed_moe_inputs(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        num_experts=num_experts,
+        quant_mode="NvFP4xNvFP4",
+        routing_method_type=RoutingMethodType.Renormalize,
+        device=device,
+    )
+    tune_max_num_tokens = num_tokens  # 256, already a power of 2
+    profile_shapes = _moe_profile_shapes(inputs, num_tokens, tune_max_num_tokens)
+
+    def _run(tactic: list[int] | None) -> torch.Tensor:
+        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP4)
+        out = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=inputs["packed_topk"],
+            routing_bias=None,
+            hidden_states=inputs["hidden_states"],
+            hidden_states_scale=inputs["hidden_states_scale"],
+            gemm1_weights=inputs["w13"],
+            gemm1_weights_scale=inputs["w13_scale"],
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=inputs["w2"],
+            gemm2_weights_scale=inputs["w2_scale"],
+            gemm2_bias=None,
+            output1_scale_scalar=inputs["output1_scale_scalar"],
+            output1_scale_gate_scalar=inputs["output1_scale_gate_scalar"],
+            output2_scale_scalar=inputs["output2_scale_scalar"],
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            do_finalize=True,
+            enable_pdl=device_support_pdl(device),
+            activation_type=ActivationType.Swiglu.value,
+            tune_max_num_tokens=tune_max_num_tokens,
+        )[0]
+        torch.cuda.synchronize()
+        return out
+
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_tokens,
+    )
+    assert valid_tactics, "No valid tactics returned — check GPU arch or module build."
+
+    tile128_tactics = [t for t in valid_tactics if t[0] == 128]
+    print(
+        f"\n[repro-4168] avg={avg} tokens/expert; "
+        f"total tactics={len(valid_tactics)}, tile_N=128 tactics={len(tile128_tactics)}: "
+        f"{tile128_tactics}"
+    )
+    # On pre-fix code the tile_N=128 set includes biasFp32M cubins and running any
+    # of them triggers an async IMA (caught below by synchronize).  On post-fix code
+    # those cubins are filtered out by mDtypeSfC, so the set may be empty or contain
+    # only safe cubins — either way the loop below completes without error.
+    if not tile128_tactics:
+        print(
+            "[repro-4168] No tile_N=128 tactics returned (biasFp32M already filtered). "
+            "This is expected post-fix behaviour."
+        )
+
+    reference = _run(None).float()
+    ref_max = reference.abs().max().item()
+    assert torch.isfinite(reference).all(), "reference output is not finite"
+
+    failures = []
+    for tactic in valid_tactics:
+        failure = _check_tactic(_run, tactic, reference, ref_max, n_iters=1)
+        if failure is not None:
+            failures.append(failure)
+
+    assert not failures, (
+        f"[repro-4168] {len(failures)} tactic(s) failed — "
+        f"if this is the IMA crash the bug is NOT fixed:\n" + "\n".join(failures[:5])
+    )
+    print("[repro-4168] All valid tactics passed. Bug is fixed (or not triggered).")
+
+
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
 @pytest.mark.parametrize("num_tokens", [16, 23, 128])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
