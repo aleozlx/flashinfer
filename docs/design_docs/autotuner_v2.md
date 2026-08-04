@@ -243,24 +243,30 @@ codegen parameters. That is structurally the vllm#43119 failure class. It is cur
 by a test; contract rule 5 above (synthesis-invariant keys backed by a debug-mode completeness
 check) is the stronger form.
 
-## 4. Why v2 is a separate entry point
+## 4. Why the two backends share one entry point
 
-The reason commonly given — "the on-disk format may be different" — is **not** load-bearing.
-Autotune caches are already per-version disposable (§2.3): `_collect_metadata()` stamps
-`flashinfer_version` and a mismatch is hard-rejected, so a v1 file is dead on the first patch bump
-regardless of what v2 does. Neither format has to read the other's data, ever.
+The reason commonly given for a separate entry point — "the on-disk format may be different" — is
+**not** load-bearing. Autotune caches are already per-version disposable (§2.3):
+`_collect_metadata()` stamps `flashinfer_version` and a mismatch is hard-rejected, so a v1 file is
+dead on the first patch bump regardless of what v2 does. Neither format has to read the other's
+data, ever.
 
-Two things do argue for a separate name, and both are migration-window problems:
+Two real objections remain to folding v2 into `autotune()`. Both are answered by making the
+backend an explicit argument rather than a new meaning for an existing one:
 
-1. **Call-site signature.** v1's `cache=<file path>` is identity-bearing; v2's `cache_root` is a
-   placement-only *directory*. An in-place swap silently redefines an argument that downstream
-   code already passes — `cache="my_configs.json"` would become "use that filename as the root
-   directory". vLLM and SGLang both call this today.
-2. **Lifetime.** v1 scopes tuning to the `with` block; v2 attaches the store for the process.
-   Changing that under existing `with autotune(...)` call sites changes what happens *after* the
-   block exits — the subtle-behavior-change class that a distinct symbol avoids.
+1. **Call-site signature.** v1's `cache=<file path>` is identity-bearing; the managed store's
+   `cache_root` is a placement-only *directory*. Redefining `cache` would silently change an
+   argument that vLLM and SGLang pass today. It is not redefined: `cache=<path>` keeps its exact
+   v1 meaning, the store is placed with a distinct `cache_root`, and combining the two raises
+   rather than guessing.
+2. **Lifetime.** v1 scopes tuning to the `with` block; the managed store attaches for the
+   process. That difference is real, but it only applies on the branch a caller explicitly opted
+   into — `autotune(True)` and `autotune(True, cache=...)` keep block-scoped semantics exactly as
+   before.
 
-Neither justifies permanent coexistence, which is what section 5 exists to prevent.
+What is left is a single decision, resolved once on entry, between two backends that cannot
+interleave (§5.1). A separate symbol would have bought the same isolation at the cost of a second
+API free to drift from the first.
 
 ## 5. Graduation plan
 
@@ -270,19 +276,51 @@ iteration is structurally forced to be `autotune_v3`. That outcome arrives by in
 end state is written down *before* downstream code adopts the name — and
 `framework_patches/vllm_autotune_v2.patch` in #3861 asks vLLM to adopt it by name now.
 
-### 5.1 End state
+### 5.1 End state — one entry point, explicit backend selection
 
-**`autotune_v2` is a transitional name.** At graduation:
+**`autotune_v2` is a transitional name, and the merge does not wait for graduation.** Both
+backends are reached through `autotune()`, with the choice named explicitly at the call site:
 
-1. `autotune()` becomes the v2 implementation.
-2. `autotune_v2` becomes a deprecated alias of `autotune()`, emitting a `DeprecationWarning`.
-3. `autotune(cache=<path>)`, `save_configs(path)`, and `load_configs(path)` are retained as thin
-   shims forwarding to the managed store, with `cache=<path>` honored as *placement only*.
-4. The alias and the v1 shims are removed no earlier than the next major version (§5.3).
+```python
+autotune(True)                        # legacy: memory only
+autotune(True, cache="cfg.json")      # legacy: JSON file cache
+autotune(True, managed_cache=True)    # managed store
+autotune(False, managed_cache=True)   # replay tuned winners, no profiling
+autotune(True, managed_cache=False)   # forbid disk for this context
+```
 
-The version number never survives into the stable API. Step 3 is what makes this cheap: it
-collapses the two-autotuner surface immediately, without waiting on a removal window, and no
-framework call site breaks at the moment of graduation.
+`managed_cache` defaults to `None` — **absent the parameter, behaviour is byte-identical to
+before it existed.** A caller opts in visibly, in the same call they were already writing, so the
+active backend is readable at the call site rather than inferred from which function was imported.
+
+Remaining steps, all backwards-compatible:
+
+1. ~~`autotune()` reaches both backends via an explicit parameter~~ *(done)*
+2. ~~`autotune_v2` becomes a thin alias over `autotune()`~~ *(done — every behaviour lives in
+   `autotune()`; the alias only spells arguments differently)*
+3. `autotune_v2` gains a `DeprecationWarning` once the frameworks have migrated (§5.2 gate 1).
+4. `save_configs(path)` / `load_configs(path)` become shims forwarding to the managed store,
+   with `path` honored as *placement only*.
+5. The alias and the v1 shims are removed no earlier than the next major version (§5.3).
+
+The version number never survives into the stable API.
+
+**Why one entry point rather than two.** Beyond the naming, a shared front door is a structural
+brake on divergence. Two separate context managers are free to drift — separate argument sets,
+separate lifetimes, separate mental models — until "migrate to v2" means relearning the API
+rather than passing a flag. Forcing both through one signature makes every divergence explicit
+and reviewable at the point it is introduced: a new v2-only argument has to justify why it cannot
+apply to both, and any behaviour that cannot be expressed as a parameter of the shared entry point
+is a design smell rather than an accident. It also makes the eventual removal of v1 a matter of
+deleting a branch, not migrating callers.
+
+**Why this is not a subtle behaviour change.** The concern with folding v2 into `autotune()` was
+that existing callers would silently get new semantics. They do not: the backend is selected by an
+argument that defaults to the legacy path, and it is resolved **once, on context entry**, before
+any state is touched. Within a context the two backends cannot interleave — the legacy file path
+runs iff `managed_cache is None`, and the managed store is consulted iff a context record was
+pushed. Mixing is prevented by construction rather than by discipline, which is the same property
+the separate-function design was reaching for.
 
 ### 5.2 Gates
 

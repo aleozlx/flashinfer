@@ -278,6 +278,23 @@ class ManagedAutotuneCache:
         )
 
 
+def _attach_managed_store(tuner, cache_root, measure):
+    """Build this context's environment manifest and attach its store.
+
+    Called from :func:`flashinfer.autotune` on the ``managed_cache=True``
+    branch.  The manifest is v1's environment metadata plus the non-default
+    fields of *measure*, so entries tuned under different measurement
+    policies land in different environment directories (design doc
+    ``docs/design_docs/autotuner_v2.md`` §2.3, §2.5).
+    """
+    from .autotuner import _collect_metadata
+
+    manifest = _collect_metadata()
+    if measure is not None:
+        manifest.update(measure.manifest_fields())
+    return _resolve_managed_store(tuner, cache_root, manifest)
+
+
 def _resolve_managed_store(tuner, cache_root, manifest: Dict[str, str]):
     """Return the managed store for ``(cache_root, manifest)`` and set it as
     the process ambient (last-wins).
@@ -443,7 +460,7 @@ def autotune_v2(
             pass
         model(inputs)  # reuses tuned winners, no context needed
     """
-    from .autotuner import AutoTuner, _collect_metadata, autotune
+    from .autotuner import autotune
 
     if mode not in ("tune", "replay"):
         raise ValueError(
@@ -458,54 +475,17 @@ def autotune_v2(
             f"{type(persistent_cache).__name__!r}; to place the store, pass "
             f"cache_root=<directory> instead."
         )
-    enable_tuning = mode == "tune"
 
-    tuner = AutoTuner.get()
-    # autotune_v2 does not nest: a v2-inside-v2 context would have ambiguous
-    # store/policy targeting (which store does the outer's later work publish
-    # to?).  Fail fast instead of silently last-wins.  Nesting a plain v1
-    # autotune() inside or around autotune_v2 is fine and stays supported.
-    if tuner._v2_local.active:
-        raise RuntimeError(
-            "nested autotune_v2 contexts are unsupported: an autotune_v2 "
-            "context is already open on this thread.  Use one context per "
-            "warmup/serving region; nesting a plain autotune() is fine."
-        )
-    # Enter the delegated context first: if its argument validation fails,
-    # this context has no lasting side effects (no attach, no policy set).
+    # Thin alias over the unified entry point.  Every behaviour lives in
+    # autotune(); this spelling exists so early adopters keep working, and is
+    # scheduled for removal per docs/design_docs/autotuner_v2.md §5.1.
     with autotune(
-        enable_tuning,
+        mode == "tune",
         tuning_buckets=tuning_buckets,
         round_up=round_up,
         skip_ops=skip_ops,
+        managed_cache=persistent_cache,
+        cache_root=cache_root if persistent_cache else None,
+        measure=measure,
     ):
-        if persistent_cache:
-            manifest = _collect_metadata()
-            if measure is not None:
-                # The policy is part of the environment identity.
-                manifest.update(measure.manifest_fields())
-            # A persistent context always attaches its store as the process
-            # ambient (last-wins), so bare serving after it exits resolves
-            # to it.
-            store = _resolve_managed_store(tuner, cache_root, manifest)
-        else:
-            # Disk forbidden for this context: lookups and publishes skip the
-            # managed store even if one is attached as ambient (the ambient
-            # remains for bare serving outside this context).
-            store = None
-            if tuner._managed_cache is not None:
-                logger.info(
-                    "[Autotuner]: autotune_v2(persistent_cache=False): disk "
-                    "access disabled inside this context; the previously "
-                    "attached store remains active for serving outside it."
-                )
-        local = tuner._v2_local
-        local.active = True
-        local.store = store
-        local.measure = measure
-        try:
-            yield
-        finally:
-            local.active = False
-            local.store = None
-            local.measure = None
+        yield
