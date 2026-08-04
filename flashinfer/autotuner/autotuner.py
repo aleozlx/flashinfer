@@ -46,6 +46,36 @@ from flashinfer.autotuner.initializers import (
 _nvfp4_cutlass_version = "0.1"
 
 
+def _reject_v1_only_args(cache) -> None:
+    """Arguments the legacy implementation alone defines."""
+    if cache is not None:
+        raise ValueError(
+            "autotune(cache=<path>) is the legacy file cache and cannot be "
+            "combined with v2_opt_in=True. v2's managed store owns placement "
+            "itself -- pass cache_root=<dir> instead of a file path."
+        )
+
+
+def _reject_v2_only_args(cache_root, persistent_cache, measure) -> None:
+    """Arguments the v2 implementation alone defines."""
+    if measure is not None:
+        raise ValueError(
+            "autotune(measure=...) selects v2's measurement policy; pass "
+            "v2_opt_in=True to use it."
+        )
+    if cache_root is not None:
+        raise ValueError(
+            "autotune(cache_root=...) places v2's managed store; pass "
+            "v2_opt_in=True to use it."
+        )
+    if not persistent_cache:
+        raise ValueError(
+            "autotune(persistent_cache=False) controls whether v2 may touch "
+            "disk; pass v2_opt_in=True to use it. The legacy path is already "
+            "memory-only unless cache=<path> is given."
+        )
+
+
 def _tactic_to_json(tactic: Any) -> Any:
     """Convert a tactic value to a JSON-compatible format.
 
@@ -763,16 +793,16 @@ def autotune(
         measure: Optional
             :class:`~flashinfer.autotune_cache.MeasurementPolicy` -- how tactics
             are timed during profiling (eager vs CUDA-graph host-cost
-            semantics). Independent of persistence: a policy without
-            ``v2_opt_in=True`` still changes measurement, it just is not
-            persisted. Under ``v2_opt_in=True`` the policy is part of the
-            store's environment identity, so entries tuned under different
-            policies never overwrite each other.
+            semantics). Requires ``v2_opt_in=True`` -- it is a v2 concept, and
+            the legacy implementation has no measurement policy. Under
+            ``persistent_cache=True`` the policy is part of the store's
+            environment identity, so entries tuned under different policies
+            never overwrite each other.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty, if ``cache``
-            is combined with ``v2_opt_in=True``, or if ``persistent_cache`` /
-            ``cache_root`` are given without ``v2_opt_in=True``.
+            is combined with ``v2_opt_in=True``, or if ``persistent_cache``,
+            ``cache_root`` or ``measure`` are given without ``v2_opt_in=True``.
         RuntimeError: If a ``v2_opt_in=True`` context is nested inside another
             one on the same thread.
 
@@ -845,34 +875,34 @@ def autotune(
     # interleave within one context: the legacy file path runs iff v2_opt_in
     # is False, and the managed store is consulted iff a _v2_local record is
     # pushed.  Design doc: docs/design_docs/autotuner_v2.md §2.1.
-    if v2_opt_in and cache is not None:
-        raise ValueError(
-            "autotune(cache=...) is the legacy file cache and cannot be "
-            "combined with v2_opt_in=True. v2's managed store owns placement "
-            "itself -- pass cache_root=<dir> instead of a file path."
-        )
-    if not v2_opt_in:
-        if cache_root is not None:
-            raise ValueError(
-                "autotune(cache_root=...) requires v2_opt_in=True; it places "
-                "v2's managed store and has no meaning for the legacy cache."
-            )
-        if not persistent_cache:
-            raise ValueError(
-                "autotune(persistent_cache=False) requires v2_opt_in=True; it "
-                "controls whether v2 may touch disk. The legacy path is "
-                "already memory-only unless cache=<path> is given."
-            )
-    if v2_opt_in and tuner._v2_local.active:
-        raise RuntimeError(
-            "nested v2 autotune contexts are unsupported: one is already open "
-            "on this thread, and a nested context would have ambiguous store "
-            "targeting. Use one context per warmup/serving region; nesting a "
-            "plain autotune() is fine."
-        )
-    # A _v2_local record is pushed when v2 is selected, or when a measurement
-    # policy is requested (meaningful without persistence).
-    push_v2_record = v2_opt_in or measure is not None
+    # ---- The bifurcation ------------------------------------------------
+    # One decision, made here, before any state is touched.  The v2 branch
+    # hands the entire context to autotune_v2() and returns; the v1 body
+    # below never runs for it.  The two implementations therefore never share
+    # a function scope, so no later edit can accidentally make one path
+    # observe the other's state.  Each branch is named positively and rejects
+    # only the arguments the *other* implementation owns, so adding a third
+    # means adding a case rather than widening what "not v2" happens to mean.
+    # Design doc: docs/design_docs/autotuner_v2.md §2.1, §5.1.
+    if v2_opt_in:
+        _reject_v1_only_args(cache)
+        from ..autotune_cache import autotune_v2
+
+        with autotune_v2(
+            mode="tune" if tune_mode else "replay",
+            persistent_cache=persistent_cache,
+            cache_root=cache_root,
+            tuning_buckets=tuning_buckets,
+            round_up=round_up,
+            skip_ops=skip_ops,
+            measure=measure,
+        ):
+            yield
+        return
+
+    _reject_v2_only_args(cache_root, persistent_cache, measure)
+
+    # ---- v1 implementation ----------------------------------------------
 
     # Load configs from cache file on entry (if it exists).  A file with
     # mismatched metadata is ignored here; whether it may be overwritten on
@@ -927,38 +957,9 @@ def autotune(
             skip_ops_stack.pop()
         raise
 
-    # Attach the managed store only after every argument has validated and
-    # the legacy stacks are pushed, so a failure above leaves no attachment
-    # behind.  v2_opt_in with persistent_cache=False deliberately pushes a
-    # record with store=None: that is what forbids disk inside this context
-    # while leaving any earlier attachment active for serving outside it.
-    if push_v2_record:
-        from ..autotune_cache import _attach_managed_store
-
-        if v2_opt_in and persistent_cache:
-            store = _attach_managed_store(tuner, cache_root, measure)
-        else:
-            store = None
-            if v2_opt_in and tuner._managed_cache is not None:
-                logger.info(
-                    "[Autotuner]: autotune(persistent_cache=False): disk "
-                    "access disabled inside this context; the previously "
-                    "attached store remains active for serving outside it."
-                )
-        local = tuner._v2_local
-        local.active = True
-        local.store = store
-        local.measure = measure
-
     try:
         yield
     finally:
-        if push_v2_record:
-            local = tuner._v2_local
-            local.active = False
-            local.store = None
-            local.measure = None
-
         with tuner._lock:
             if tune_mode:
                 tuner._active_tuning_contexts -= 1

@@ -201,15 +201,27 @@ def test_replay_mode_does_not_profile(cache_root, monkeypatch):
     assert calls == []
 
 
-def test_measure_policy_without_v2_opt_in(cache_root, monkeypatch):
-    """A measurement policy is independent of persistence: it applies without
-    v2_opt_in=True, and publishes nothing."""
+def test_measure_policy_requires_v2_opt_in(cache_root):
+    """measure= is a v2 concept; the legacy path has no measurement policy."""
+    with (
+        pytest.raises(ValueError, match="measure=.*v2_opt_in=True"),
+        autotune(True, measure=MeasurementPolicy(execution_mode="eager")),
+    ):
+        pass
+
+
+def test_measure_policy_without_persistence(cache_root, monkeypatch):
+    """A policy applies under v2 without touching disk."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, measure=MeasurementPolicy(execution_mode="eager")):
+    with autotune(
+        True,
+        v2_opt_in=True,
+        persistent_cache=False,
+        measure=MeasurementPolicy(execution_mode="eager"),
+    ):
         _, tactic = _choose()
     assert tactic == 1
     assert not _entry_files(cache_root)
-    assert AutoTuner.get()._managed_cache is None
 
 
 # --------------------------------------------------------------------------

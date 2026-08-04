@@ -460,7 +460,7 @@ def autotune_v2(
             pass
         model(inputs)  # reuses tuned winners, no context needed
     """
-    from .autotuner import autotune
+    from .autotuner import AutoTuner, autotune
 
     if mode not in ("tune", "replay"):
         raise ValueError(
@@ -476,17 +476,45 @@ def autotune_v2(
             f"cache_root=<directory> instead."
         )
 
-    # Thin alias over the unified entry point.  Every behaviour lives in
-    # autotune(); this spelling exists so early adopters keep working, and is
-    # scheduled for removal per docs/design_docs/autotuner_v2.md §5.1.
+    tuner = AutoTuner.get()
+    if tuner._v2_local.active:
+        raise RuntimeError(
+            "nested v2 autotune contexts are unsupported: one is already open "
+            "on this thread, and a nested context would have ambiguous store "
+            "targeting. Use one context per warmup/serving region; nesting a "
+            "plain autotune() is fine."
+        )
+    # Shared machinery (bucketing, skip_ops, tuning-mode refcount) comes from
+    # the v1 context; persistence and measurement are this function's job.
+    # autotune(v2_opt_in=True) dispatches HERE, so this call must not pass
+    # v2_opt_in back or it would recurse.
     with autotune(
         mode == "tune",
         tuning_buckets=tuning_buckets,
         round_up=round_up,
         skip_ops=skip_ops,
-        v2_opt_in=True,
-        persistent_cache=persistent_cache,
-        cache_root=cache_root if persistent_cache else None,
-        measure=measure,
     ):
-        yield
+        if persistent_cache:
+            # Attaches as the process ambient (last-wins), so bare serving
+            # after this context exits resolves to it.
+            store = _attach_managed_store(tuner, cache_root, measure)
+        else:
+            # Disk forbidden here; any earlier attachment stays active for
+            # serving outside this context.
+            store = None
+            if tuner._managed_cache is not None:
+                logger.info(
+                    "[Autotuner]: persistent_cache=False: disk access "
+                    "disabled inside this context; the previously attached "
+                    "store remains active for serving outside it."
+                )
+        local = tuner._v2_local
+        local.active = True
+        local.store = store
+        local.measure = measure
+        try:
+            yield
+        finally:
+            local.active = False
+            local.store = None
+            local.measure = None

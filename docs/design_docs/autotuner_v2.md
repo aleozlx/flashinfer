@@ -74,8 +74,11 @@ model(inputs)
 does not change under them. Bucketing (`tuning_buckets`, `round_up`, `skip_ops`) is shared
 unchanged; only persistence and measurement differ.
 
-`flashinfer.autotune_v2(mode=..., persistent_cache=...)` remains as a thin alias over the same
-call for early adopters, and is scheduled for removal (§5.1).
+`autotune()` is a **dispatcher**, not a merged body: `v2_opt_in=True` hands the whole context to
+`autotune_v2()` and returns, so the v1 body never runs for it and the two implementations never
+share a function scope. `autotune_v2(mode=..., persistent_cache=...)` remains directly callable
+for early adopters, and is scheduled for removal as a public name (§5.1) — the implementation it
+holds is where v2 lives either way.
 
 **Attach semantics.** `persistent_cache=True` attaches the store for the remainder of the
 *process*; the context scopes only *when profiling cost may be paid*. This is forced by how the
@@ -333,8 +336,9 @@ transitional switch alive forever. The durable knobs — `persistent_cache`, `ca
 Remaining steps, all backwards-compatible:
 
 1. ~~`autotune()` reaches both backends via an explicit parameter~~ *(done)*
-2. ~~`autotune_v2` becomes a thin alias over `autotune()`~~ *(done — every behaviour lives in
-   `autotune()`; the alias only spells arguments differently)*
+2. ~~`autotune()` dispatches to `autotune_v2()`~~ *(done — v2's implementation stays in
+   `autotune_cache.py`; `autotune()` only chooses. The v1 body and the v2 body are separate
+   functions, so a later edit to one cannot make the other observe its state)*
 3. `autotune_v2` gains a `DeprecationWarning` once the frameworks have migrated (§5.2 gate 1).
 4. `v2_opt_in` **defaults to `True`** once the gates in §5.2 are met. Callers passing it
    explicitly keep working; callers relying on the legacy default surface here, before anything
