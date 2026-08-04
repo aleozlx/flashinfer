@@ -484,7 +484,8 @@ def autotune_v2(
         tuning_buckets=tuning_buckets,
         round_up=round_up,
         skip_ops=skip_ops,
-        managed_cache=persistent_cache,
+        v2_opt_in=True,
+        persistent_cache=persistent_cache,
         cache_root=cache_root if persistent_cache else None,
         measure=measure,
     ):

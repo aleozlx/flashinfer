@@ -1,18 +1,19 @@
 # Autotuner v2 — Managed Persistence, Deployment-Matched Measurement, and the Runner Contract
 
-**Scope**: `flashinfer/autotune_cache.py` (the whole module) and the `autotune_v2` state and hook
-sites in `flashinfer/autotuner/autotuner.py` — the managed store, the measurement policy, and the
-runner contract that tactic identities must satisfy.
+**Scope**: `flashinfer/autotune_cache.py` (the whole module) and the **v2 branch** of
+`flashinfer/autotuner/autotuner.py` — the `v2_opt_in` argument handling, the managed-store state
+and hook sites, the measurement policy, and the runner contract that tactic identities must
+satisfy.
 
-**Not** in scope: the v1 path — `autotune()`, `save_configs()`, `load_configs()`, and the
-profiling machinery they share. That code predates this document and has none of its own; changing
-it does not oblige you to update this doc. §5 is where the two are planned to converge, and the
-day v1 is folded into v2 this scope line should widen to match.
+**Not** in scope: the v1 branch — `autotune()`'s legacy file cache, `save_configs()`,
+`load_configs()`, and the profiling machinery both share. That code predates this document and has
+none of its own; changing it does not oblige you to update this doc. §5 is where the two converge,
+and the day v1 is deleted this scope line widens to the whole module.
 
 **Status**: proposed. RFC [#3920](https://github.com/flashinfer-ai/flashinfer/issues/3920); this
 document ships with the v2 MVP in
-[#3861](https://github.com/flashinfer-ai/flashinfer/pull/3861) (opt-in; `autotune()` and the v1
-cache path are untouched). Sections 1–4 describe the design as implemented in this branch;
+[#3861](https://github.com/flashinfer-ai/flashinfer/pull/3861) (opt-in; the v1 cache path is
+behaviourally untouched). Sections 1–4 describe the design as implemented in this branch;
 section 5 (graduation) is the part that is **not** yet agreed and is the reason this document
 exists.
 
@@ -48,30 +49,33 @@ unusable entries as work to rebuild).
 
 ### 2.1 API surface
 
-v2 is a standalone context manager, deliberately disjoint from `autotune()`:
+v2 is reached through `autotune()`, the existing entry point, via an explicit opt-in argument:
 
 ```python
-with flashinfer.autotune_v2(measure=MeasurementPolicy(execution_mode="cuda_graph")):
+with flashinfer.autotune(True, v2_opt_in=True,
+                         measure=MeasurementPolicy(execution_mode="cuda_graph")):
     model(dummy_inputs)      # warmup: tune misses, publish each winner atomically
 model(inputs)                # serving: reuses entries, no context needed
 
 # fresh process, same environment
-with flashinfer.autotune_v2(mode="replay"):
+with flashinfer.autotune(False, v2_opt_in=True):
     pass                     # hydrate only
 model(inputs)
 ```
 
-| `mode` | `persistent_cache` | meaning |
+| `tune_mode` | `persistent_cache` | meaning (with `v2_opt_in=True`) |
 |---|---|---|
-| `"tune"` | True *(default)* | tune misses, publish to disk |
-| `"tune"` | False | tune in-memory only (disk forbidden) |
-| `"replay"` | True | serve from the on-disk store, no profiling |
-| `"replay"` | False | memory-only replay (already-hydrated winners) |
+| `True` *(default)* | True *(default)* | tune misses, publish to disk |
+| `True` | False | tune in-memory only (disk forbidden) |
+| `False` | True | serve from the on-disk store, no profiling |
+| `False` | False | memory-only replay (already-hydrated winners) |
 
-`mode` names a positive action rather than a negated flag: `mode="replay"` is the serving path,
-which does not read like "throw the tuning results away" the way `enable_tuning=False` did.
-Bucketing (`tuning_buckets`, `round_up`, `skip_ops`) is delegated to `autotune()` unchanged;
-only persistence and measurement differ.
+`tune_mode` keeps its v1 meaning under both implementations, so the axis a caller already knows
+does not change under them. Bucketing (`tuning_buckets`, `round_up`, `skip_ops`) is shared
+unchanged; only persistence and measurement differ.
+
+`flashinfer.autotune_v2(mode=..., persistent_cache=...)` remains as a thin alias over the same
+call for early adopters, and is scheduled for removal (§5.1).
 
 **Attach semantics.** `persistent_cache=True` attaches the store for the remainder of the
 *process*; the context scopes only *when profiling cost may be paid*. This is forced by how the
@@ -129,7 +133,7 @@ maintaining a migration path for data that is, by construction, an optimization.
   winner it had already measured.
 - **No locks.** Concurrent writers do redundant work and the last valid write wins. This is what
   makes SGLang's all-ranks-tune-simultaneously pattern safe with zero framework code — and it is
-  a deliberate divergence from the JIT kernel cache (§4), where single-flight is correct.
+  a deliberate divergence from the JIT kernel cache (§3), where single-flight is correct.
 - **Invalid is a miss, never an error.** A missing file, malformed JSON, or an embedded-key
   mismatch logs a warning and returns "not found". A corrupt entry costs one retune, not a dead
   server, and cannot take the other entries with it.
@@ -276,6 +280,31 @@ iteration is structurally forced to be `autotune_v3`. That outcome arrives by in
 end state is written down *before* downstream code adopts the name — and
 `framework_patches/vllm_autotune_v2.patch` in #3861 asks vLLM to adopt it by name now.
 
+> ### ⚠️ Critical assumption — **not** yet decided
+>
+> Everything below assumes **v1 is eventually removed**. That is an assumption, not a decision.
+> Nobody has committed to it, there is no date, and there is no named owner for the migration.
+> It is written here so it can be argued with, not so it can be inherited silently.
+>
+> For it to hold, all of these must become true:
+>
+> 1. vLLM and SGLang migrate **and stay migrated** — no path quietly reverts to `cache=<path>`.
+> 2. New TensorRT-LLM integrations land against the runner contract (§2.6) rather than against
+>    v1's cache format. v1 is largely a TRT-LLM integration; if upstream changes keep arriving
+>    shaped like v1, v1 is load-bearing indefinitely.
+> 3. A major version is available to remove in (§5.3), with someone willing to spend the break.
+>
+> If any fails, the honest end state is not "graduation" but **indefinite coexistence with a
+> preferred default** — v2 as the default implementation, v1 retained as a supported path. That
+> is a legitimate outcome and this document should be updated to say so plainly rather than
+> leaving a removal plan that never executes.
+>
+> **What does not depend on this assumption**: steps 1–2 of §5.1 — one entry point and the alias
+> — are worth doing under either outcome. Permanent coexistence is precisely the scenario where
+> two front doors drift the most, so a shared signature is *more* valuable if v1 stays, not less.
+> Steps 3–7 are the conditional part. Read the split that way: the merge is unconditional, the
+> removal is a hypothesis.
+
 ### 5.1 End state — one entry point, explicit backend selection
 
 **`autotune_v2` is a transitional name, and the merge does not wait for graduation.** Both
@@ -284,14 +313,22 @@ backends are reached through `autotune()`, with the choice named explicitly at t
 ```python
 autotune(True)                        # legacy: memory only
 autotune(True, cache="cfg.json")      # legacy: JSON file cache
-autotune(True, managed_cache=True)    # managed store
-autotune(False, managed_cache=True)   # replay tuned winners, no profiling
-autotune(True, managed_cache=False)   # forbid disk for this context
+autotune(True, v2_opt_in=True)        # v2 + managed store
+autotune(False, v2_opt_in=True)       # v2 replay, no profiling
+autotune(True, v2_opt_in=True, persistent_cache=False)   # v2, no disk
 ```
 
-`managed_cache` defaults to `None` — **absent the parameter, behaviour is byte-identical to
-before it existed.** A caller opts in visibly, in the same call they were already writing, so the
-active backend is readable at the call site rather than inferred from which function was imported.
+`v2_opt_in` defaults to `False` — **absent the parameter, behaviour is byte-identical to before
+it existed.** A caller opts in visibly, in the same call they were already writing, so the active
+implementation is readable at the call site rather than inferred from which function was imported.
+
+The name is deliberately a version, not a behaviour. A version-named flag **announces its own
+expiry**: nobody builds long-term configuration around `v2_opt_in=True`, and it retires along a
+path a function name cannot offer — flip the default, then ignore the argument internally once no
+caller passes it, then delete it, with callers working throughout. A behaviour-named flag
+(`managed_cache=`) would read as permanent and invite exactly the cargo-culting that keeps a
+transitional switch alive forever. The durable knobs — `persistent_cache`, `cache_root`,
+`measure` — carry behaviour names because they survive v1's removal.
 
 Remaining steps, all backwards-compatible:
 
@@ -299,20 +336,43 @@ Remaining steps, all backwards-compatible:
 2. ~~`autotune_v2` becomes a thin alias over `autotune()`~~ *(done — every behaviour lives in
    `autotune()`; the alias only spells arguments differently)*
 3. `autotune_v2` gains a `DeprecationWarning` once the frameworks have migrated (§5.2 gate 1).
-4. `save_configs(path)` / `load_configs(path)` become shims forwarding to the managed store,
+4. `v2_opt_in` **defaults to `True`** once the gates in §5.2 are met. Callers passing it
+   explicitly keep working; callers relying on the legacy default surface here, before anything
+   is deleted.
+5. `v2_opt_in` is **ignored internally** once no caller passes `False` — the argument is accepted
+   and does nothing, so no call site breaks while v1 is deleted underneath it.
+6. `save_configs(path)` / `load_configs(path)` become shims forwarding to the managed store,
    with `path` honored as *placement only*.
-5. The alias and the v1 shims are removed no earlier than the next major version (§5.3).
+7. `v2_opt_in`, the alias, and the v1 shims are removed no earlier than the next major
+   version (§5.3).
+
+Steps 4 and 5 are the point of a parameter: each is independently verifiable and revertible, and
+no step requires a caller to change at the same time the implementation does.
 
 The version number never survives into the stable API.
 
-**Why one entry point rather than two.** Beyond the naming, a shared front door is a structural
-brake on divergence. Two separate context managers are free to drift — separate argument sets,
-separate lifetimes, separate mental models — until "migrate to v2" means relearning the API
-rather than passing a flag. Forcing both through one signature makes every divergence explicit
-and reviewable at the point it is introduced: a new v2-only argument has to justify why it cannot
-apply to both, and any behaviour that cannot be expressed as a parameter of the shared entry point
-is a design smell rather than an accident. It also makes the eventual removal of v1 a matter of
-deleting a branch, not migrating callers.
+**Why one entry point rather than two.** Beyond naming, a shared front door is a structural brake
+on divergence. Two separate context managers are free to drift — separate argument sets, separate
+lifetimes, separate mental models — until "migrate to v2" means relearning the API rather than
+passing a flag. One signature makes every divergence explicit and reviewable where it is
+introduced: a v2-only argument has to justify why it cannot apply to both, and behaviour that
+cannot be expressed as a parameter of the shared entry point is a design smell rather than an
+accident.
+
+The two properties that decided it — retirement options, and what happens to future edits:
+
+| | separate `autotune_v2()` | `autotune(v2_opt_in=True)` |
+|---|---|---|
+| **Retirement steps** | exists, or does not. Removal is one breaking edit for every caller. | flip the default → ignore the argument internally once no caller passes it → delete. Callers keep working at every step. |
+| **Can it be retired incrementally?** | No. A function cannot be "ignored" — importing it either resolves or raises. | Yes. Each step is independently verifiable and independently revertible. |
+| **Verification before removal** | Grep for the symbol, then break whoever was missed. | Flip the default and observe: anything still passing it explicitly shows up before anything is deleted. |
+| **Adding a feature to shared machinery** | Must be plumbed into two entry points; forgetting one is silent, and the two drift by omission. | Lands once. The shared signature is the place where "does this apply to both?" gets asked. |
+| **Adding a v1-only fix** (e.g. a ported TRT-LLM change) | Invisible to v2 unless someone remembers to mirror it. | Sits on the `v2_opt_in is False` branch, adjacent to the v2 branch it must not regress — the reviewer sees both. |
+| **Cost of divergence** | Paid later, all at once, as a migration. | Paid immediately, per change, as a review question. |
+
+The right column is why the merge does not wait for graduation: the longer two entry points exist,
+the more divergence accumulates that someone must later reconcile. It also makes the eventual
+removal of v1 a matter of deleting a branch rather than migrating callers.
 
 **Why this is not a subtle behaviour change.** The concern with folding v2 into `autotune()` was
 that existing callers would silently get new semantics. They do not: the backend is selected by an

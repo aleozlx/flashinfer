@@ -1,4 +1,4 @@
-"""Unified-API dispatch tests: ``autotune(managed_cache=...)``.
+"""Unified-API dispatch tests: ``autotune(v2_opt_in=...)``.
 
 The managed store and the legacy JSON file cache are two persistence
 backends behind one entry point.  These tests pin the property that makes
@@ -65,35 +65,35 @@ def _entry_files(cache_root):
 # --------------------------------------------------------------------------
 
 
-def test_cache_and_managed_cache_are_mutually_exclusive(cache_root, tmp_path):
+def test_cache_and_v2_opt_in_are_mutually_exclusive(cache_root, tmp_path):
     with (
-        pytest.raises(ValueError, match="different persistence backends"),
-        autotune(True, cache=str(tmp_path / "v1.json"), managed_cache=True),
+        pytest.raises(ValueError, match="cannot be combined with v2_opt_in"),
+        autotune(True, cache=str(tmp_path / "v1.json"), v2_opt_in=True),
     ):
         pass
 
 
-def test_cache_root_requires_managed_cache(cache_root, tmp_path):
+def test_cache_root_requires_v2_opt_in(cache_root, tmp_path):
     with (
-        pytest.raises(ValueError, match="requires managed_cache=True"),
+        pytest.raises(ValueError, match="requires v2_opt_in=True"),
         autotune(True, cache_root=str(tmp_path)),
     ):
         pass
 
 
-def test_managed_cache_does_not_nest(cache_root):
+def test_v2_context_does_not_nest(cache_root):
     with (  # noqa: SIM117 - the nesting is what this test exercises
-        pytest.raises(RuntimeError, match="nested managed-cache"),
-        autotune(True, managed_cache=True),
+        pytest.raises(RuntimeError, match="nested v2 autotune"),
+        autotune(True, v2_opt_in=True),
     ):
-        with autotune(True, managed_cache=True):
+        with autotune(True, v2_opt_in=True):
             pass
 
 
 def test_plain_autotune_still_nests_inside_managed(cache_root, monkeypatch):
     """Only the managed backend is non-nestable; plain autotune() is fine."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, managed_cache=True):  # noqa: SIM117 - nesting is the subject
+    with autotune(True, v2_opt_in=True):  # noqa: SIM117 - nesting is the subject
         with autotune(True):
             _, tactic = _choose()
     assert tactic == 1
@@ -104,7 +104,7 @@ def test_failed_validation_leaves_no_attachment(cache_root, tmp_path):
     tuner = AutoTuner.get()
     with (
         pytest.raises(ValueError),
-        autotune(True, cache=str(tmp_path / "v1.json"), managed_cache=True),
+        autotune(True, cache=str(tmp_path / "v1.json"), v2_opt_in=True),
     ):
         pass
     assert tuner._managed_cache is None
@@ -117,7 +117,7 @@ def test_empty_buckets_still_raise_before_attaching(cache_root):
     tuner = AutoTuner.get()
     with (
         pytest.raises(ValueError, match="tuning_buckets"),
-        autotune(True, tuning_buckets=(), managed_cache=True),
+        autotune(True, tuning_buckets=(), v2_opt_in=True),
     ):
         pass
     assert tuner._managed_cache is None
@@ -128,9 +128,9 @@ def test_empty_buckets_still_raise_before_attaching(cache_root):
 # --------------------------------------------------------------------------
 
 
-def test_managed_cache_true_publishes_to_store(cache_root, monkeypatch):
+def test_v2_opt_in_publishes_to_store(cache_root, monkeypatch):
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, managed_cache=True):
+    with autotune(True, v2_opt_in=True):
         _, tactic = _choose()
     assert tactic == 1
     entries = _entry_files(cache_root)
@@ -139,7 +139,7 @@ def test_managed_cache_true_publishes_to_store(cache_root, monkeypatch):
 
 
 def test_default_is_byte_identical_legacy(cache_root, monkeypatch, tmp_path):
-    """No managed_cache argument -> the v1 path, untouched: a JSON file and
+    """No v2_opt_in argument -> the v1 path, untouched: a JSON file and
     no managed directory anywhere."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     path = tmp_path / "v1.json"
@@ -150,35 +150,35 @@ def test_default_is_byte_identical_legacy(cache_root, monkeypatch, tmp_path):
     assert AutoTuner.get()._managed_cache is None
 
 
-def test_managed_cache_writes_no_v1_file(cache_root, monkeypatch):
+def test_v2_writes_no_v1_file(cache_root, monkeypatch):
     """The managed branch must not populate v1's in-memory file configs."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     tuner = AutoTuner.get()
-    with autotune(True, managed_cache=True):
+    with autotune(True, v2_opt_in=True):
         _choose()
     assert tuner._file_configs == {}
 
 
-def test_managed_cache_false_forbids_disk(cache_root, monkeypatch):
-    """managed_cache=False tunes in memory even though a store is attached."""
+def test_persistent_cache_false_forbids_disk(cache_root, monkeypatch):
+    """v2_opt_in=True, persistent_cache=False tunes in memory even though a store is attached."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, managed_cache=True):
+    with autotune(True, v2_opt_in=True):
         _choose()
     assert len(_entry_files(cache_root)) == 1
 
     reset_autotuner()  # keeps the attached store, drops tuned winners
     _install_fake_profile(monkeypatch, times={0: 1.0, 1: 3.0, 2: 2.0})
-    with autotune(True, managed_cache=False):
+    with autotune(True, v2_opt_in=True, persistent_cache=False):
         _, tactic = _choose()
     assert tactic == 0  # freshly measured, not the stored winner
     assert len(_entry_files(cache_root)) == 1  # nothing new published
 
 
 def test_attach_survives_context_exit(cache_root, monkeypatch):
-    """managed_cache=True attaches for the process: serving afterwards, with
+    """v2_opt_in=True attaches for the process: serving afterwards, with
     no context at all, still resolves to the store."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, managed_cache=True):
+    with autotune(True, v2_opt_in=True):
         _choose()
 
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
@@ -190,20 +190,20 @@ def test_attach_survives_context_exit(cache_root, monkeypatch):
 
 def test_replay_mode_does_not_profile(cache_root, monkeypatch):
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, managed_cache=True):
+    with autotune(True, v2_opt_in=True):
         _choose()
 
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     reset_autotuner()
-    with autotune(False, managed_cache=True):
+    with autotune(False, v2_opt_in=True):
         _, tactic = _choose()
     assert tactic == 1
     assert calls == []
 
 
-def test_measure_policy_without_managed_cache(cache_root, monkeypatch):
+def test_measure_policy_without_v2_opt_in(cache_root, monkeypatch):
     """A measurement policy is independent of persistence: it applies without
-    managed_cache=True, and publishes nothing."""
+    v2_opt_in=True, and publishes nothing."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     with autotune(True, measure=MeasurementPolicy(execution_mode="eager")):
         _, tactic = _choose()
@@ -220,7 +220,7 @@ def test_measure_policy_without_managed_cache(cache_root, monkeypatch):
 @pytest.mark.parametrize(
     "opener",
     [
-        lambda: autotune(True, managed_cache=True),
+        lambda: autotune(True, v2_opt_in=True),
         lambda: autotune_v2(),
         lambda: autotune_v2(mode="tune", persistent_cache=True),
     ],
@@ -248,7 +248,7 @@ def test_alias_replay_maps_to_tune_mode_false(cache_root, monkeypatch):
 
 
 def test_alias_rejects_nesting_via_unified_guard(cache_root):
-    with pytest.raises(RuntimeError, match="nested managed-cache"), autotune_v2():  # noqa: SIM117 - nesting is the subject
+    with pytest.raises(RuntimeError, match="nested v2 autotune"), autotune_v2():  # noqa: SIM117 - nesting is the subject
         with autotune_v2():
             pass
 
