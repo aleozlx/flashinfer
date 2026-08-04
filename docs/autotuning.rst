@@ -79,10 +79,14 @@ When a FlashInfer operation executes, the autotuner resolves the best
    process.
 2. **User-loaded file configs** — loaded via ``load_configs()`` or
    ``autotune(cache=...)``.
-3. **Bundled package configs** — legacy ``.py`` config files shipped with
+3. **Managed store entries** — the on-disk store used by
+   ``autotune(v2_opt_in=True)``, consulted once per key per process and then
+   memoized. Only present when a store is attached; see
+   :ref:`autotuner-v2` below.
+4. **Bundled package configs** — legacy ``.py`` config files shipped with
    FlashInfer (only when the ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1``
    environment variable is set and tuning mode is off).
-4. **Fallback tactic (−1)** — a safe default that every runner must implement.
+5. **Fallback tactic (−1)** — a safe default that every runner must implement.
 
 Notably, user-loaded file configs (level 2) are
 **always consulted, even during tuning mode**, so that already-tuned shapes
@@ -97,6 +101,11 @@ Config Caching
    Single-process and multi-threaded use is fully supported.
    Multi-process and multi-node use is best-effort: concurrent writes to
    a shared cache file may result in lost updates from race conditions.
+
+   This caveat applies to the **legacy file cache** described in this
+   section. The managed store (``autotune(v2_opt_in=True)``, see
+   :ref:`autotuner-v2`) publishes one atomic file per tuned operation and
+   is safe for concurrent multi-rank tuning.
 
 By default, autotuning results live only in memory and are lost when the
 process exits.  The ``cache`` parameter on ``flashinfer.autotune`` lets you
@@ -262,6 +271,125 @@ JSON arrays and restored to tuples on load.
 The file is human-readable but not portable. Config ordering is not guaranteed to be
 stable across FlashInfer, CUDA, cuDNN, or cuBLAS versions.
 
+.. _autotuner-v2:
+
+Autotuner v2 — Managed Persistence (Experimental)
+-------------------------------------------------
+
+.. note::
+
+   **Experimental and opt-in.** ``v2_opt_in`` is a transitional argument: it
+   exists so callers migrate explicitly rather than by surprise, and it is
+   expected to be removed once the default flips. Do not build long-term
+   configuration around it. Design rationale, including what is *not* yet
+   decided about v1's future, is in ``docs/design_docs/autotuner_v2.md``.
+
+With the legacy cache, the *caller* owns persistence: the filename is the cache
+identity, so every consumer reimplements hashing, atomic writes, and staleness
+handling. Autotuner v2 moves that ownership into FlashInfer. Opt in with
+``v2_opt_in=True``:
+
+.. code-block:: python
+
+    import flashinfer
+
+    # Warmup: tune uncovered shapes and publish each winner atomically.
+    with flashinfer.autotune(True, v2_opt_in=True):
+        model(dummy_inputs)
+
+    # Serving: no context needed -- the store stays attached for the process.
+    model(inputs)
+
+A later process in the same environment hydrates instead of profiling:
+
+.. code-block:: python
+
+    with flashinfer.autotune(False, v2_opt_in=True):
+        pass                       # hydrate only
+    model(inputs)                  # reuses tuned winners
+
+``tune_mode`` keeps its meaning: ``True`` profiles and publishes, ``False``
+replays already-tuned winners without profiling.
+
+What it changes
+^^^^^^^^^^^^^^^
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 39 39
+
+   * -
+     - Legacy (``cache=<path>``)
+     - v2 (``v2_opt_in=True``)
+   * - Cache identity
+     - The filename you choose
+     - An environment hash FlashInfer computes
+   * - Unit of write
+     - One JSON file, rewritten on exit
+     - One atomic file per tuned operation, published as it is measured
+   * - Concurrent ranks
+     - Best-effort; writes can be lost
+     - Safe -- redundant work, last valid write wins
+   * - Crash mid-tuning
+     - Nothing is saved
+     - Every winner measured so far is already on disk
+   * - Wrong environment
+     - Whole file rejected; you pick a new path
+     - A different directory; nothing to invalidate by hand
+
+Cache location
+^^^^^^^^^^^^^^
+
+The store lives under ``FLASHINFER_CACHE_DIR/autotune``, overridable with the
+``FLASHINFER_AUTOTUNE_CACHE_DIR`` environment variable or the ``cache_root``
+argument. ``cache_root`` is a **directory** and is placement only -- schema and
+environment namespaces live below it, so no choice of root can mix incompatible
+entries::
+
+    <root>/v2/<environment_hash>/
+        manifest.json                # the environment, human-readable
+        entries/<operation_hash>.json
+
+Entries do not survive a FlashInfer upgrade: the version is part of the
+environment hash, so a new version simply starts a new directory and the old
+one is left alone. Autotune data is a disposable optimization -- re-tuning once
+after an upgrade is the intended cost.
+
+Measurement policy
+^^^^^^^^^^^^^^^^^^
+
+Tuning measures the way you deploy. The decisive question is whether per-call
+**host** cost counts: under CUDA-graph serving it is paid once at capture, but
+under eager serving it is paid on every call.
+
+.. code-block:: python
+
+    from flashinfer import MeasurementPolicy
+
+    with flashinfer.autotune(
+        True, v2_opt_in=True,
+        measure=MeasurementPolicy(execution_mode="cuda_graph"),
+    ):
+        model(dummy_inputs)
+
+``execution_mode`` accepts ``"auto"`` (default, today's behavior),
+``"cuda_graph"``, or ``"eager"``. The policy is part of the store's environment
+identity, so entries tuned under different policies never overwrite each other.
+
+Distributed use
+^^^^^^^^^^^^^^^
+
+With a shared filesystem, every rank may tune simultaneously: publishes are
+atomic and redundant work is harmless. Ranks may still hold different
+locally-measured winners in memory until they re-read the store; after a
+post-tuning barrier, call:
+
+.. code-block:: python
+
+    flashinfer.autotune_v2_reload()
+
+so every rank serves byte-identical tactics.
+
 API Reference
 -------------
 
@@ -292,6 +420,24 @@ Context manager for autotuning with optional file-based caching.
      - Optional path to a JSON config file.
        On entry, configs are loaded from this file if it exists.
        On exit, configs are saved back to this file when ``tune_mode=True``.
+       Legacy implementation only; cannot be combined with ``v2_opt_in=True``.
+   * - ``v2_opt_in``
+     - ``bool``
+     - Opt into the v2 implementation (managed store). ``False`` (default) is
+       byte-identical to before this argument existed. **Transitional** --
+       see :ref:`autotuner-v2`.
+   * - ``persistent_cache``
+     - ``bool``
+     - Whether v2 may touch disk. ``True`` (default) attaches the managed
+       store for the remainder of the process. Requires ``v2_opt_in=True``.
+   * - ``cache_root``
+     - ``str | None``
+     - Root **directory** for the managed store (placement only). Defaults to
+       ``FLASHINFER_AUTOTUNE_CACHE_DIR`` or ``FLASHINFER_CACHE_DIR/autotune``.
+       Requires ``v2_opt_in=True``.
+   * - ``measure``
+     - ``MeasurementPolicy | None``
+     - How tactics are timed during profiling. Requires ``v2_opt_in=True``.
 
 **Behavior matrix:**
 
@@ -324,6 +470,44 @@ Context manager for autotuning with optional file-based caching.
      - No
      - No
      - No-op (default behavior)
+
+
+``flashinfer.MeasurementPolicy``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: python
+
+    flashinfer.MeasurementPolicy(execution_mode: str = "auto",
+                                 cold_l2: bool | None = None)
+
+How tuning measurements are taken. ``execution_mode`` is ``"auto"`` (today's
+behavior), ``"cuda_graph"`` (host cost excluded, as graph serving pays it), or
+``"eager"`` (per-call host cost included). ``cold_l2`` forces cold- or hot-L2
+profiling; ``None`` inherits each operation's default. Part of the store's
+environment identity -- see :ref:`autotuner-v2`.
+
+``flashinfer.autotune_v2_reload``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: python
+
+    flashinfer.autotune_v2_reload() -> None
+
+Drops in-process tuned winners so later lookups re-read the managed store.
+Call on every rank *after* a post-tuning barrier so all ranks serve
+byte-identical tactics.
+
+``flashinfer.autotune_v2``
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: python
+
+    flashinfer.autotune_v2(mode: str = "tune", persistent_cache: bool = True, ...)
+
+The v2 implementation, callable directly. ``autotune(v2_opt_in=True)``
+dispatches to it. ``mode="tune"`` / ``"replay"`` corresponds to
+``tune_mode=True`` / ``False``. Prefer the ``autotune()`` spelling: this name
+is scheduled for removal.
 
 Multi-Thread / Multi-Process Considerations
 --------------------------------------------

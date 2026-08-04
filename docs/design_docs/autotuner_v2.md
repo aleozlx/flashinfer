@@ -414,12 +414,17 @@ does eventually dropping the `autotune_v2` alias. So:
 Nothing about graduation deletes user cache files: old environment directories are left on disk
 and simply stop being consulted.
 
-### 5.4 Documentation debt
+### 5.4 Documentation
 
-`docs/autotuning.rst` (419 lines) currently documents `autotune(cache=path)` / `save_configs` /
-`load_configs` as *the* public API and does not mention v2. #3861 does not touch it. Until it
-does, the shipped documentation describes v1 only and nothing in-tree forces the reckoning.
-Graduation must update that file in the same change that swaps the implementation.
+`docs/autotuning.rst` now documents both implementations: an
+:ref:`autotuner-v2`-anchored section (opt-in, store layout, measurement policy, distributed use),
+API-reference entries for `v2_opt_in` / `persistent_cache` / `cache_root` / `measure` /
+`MeasurementPolicy` / `autotune_v2_reload`, the managed store added to the lookup-priority list,
+and a qualifier on the concurrent-write caveat noting it describes the legacy file cache only.
+
+Two documentation obligations remain tied to later graduation steps: when `v2_opt_in` flips to
+`True` by default (§5.1 step 4) the opt-in examples become the unqualified ones, and when the
+argument is removed (step 7) the transitional wording goes with it.
 
 ## 6. Alternatives considered
 
