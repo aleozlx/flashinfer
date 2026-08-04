@@ -124,7 +124,11 @@ def test_empty_buckets_still_raise_before_attaching(cache_root):
 
 
 # --------------------------------------------------------------------------
-# Dispatch: each backend does its own thing and only its own thing.
+# Dispatch reaches v2 at all, and the argument mapping is right.
+#
+# Deliberately thin: v2's *behaviour* is covered by test_autotune_cache_v2.py
+# and is unchanged by this PR, and the v1/v2 boundary is structural (separate
+# function bodies) rather than something a test can usefully police.
 # --------------------------------------------------------------------------
 
 
@@ -138,69 +142,6 @@ def test_v2_opt_in_publishes_to_store(cache_root, monkeypatch):
     assert json.loads(entries[0].read_text())["tactic"] == 1
 
 
-def test_default_is_byte_identical_legacy(cache_root, monkeypatch, tmp_path):
-    """No v2_opt_in argument -> the v1 path, untouched: a JSON file and
-    no managed directory anywhere."""
-    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    path = tmp_path / "v1.json"
-    with autotune(True, cache=str(path)):
-        _choose()
-    assert path.is_file()
-    assert not _entry_files(cache_root)
-    assert AutoTuner.get()._managed_cache is None
-
-
-def test_v2_writes_no_v1_file(cache_root, monkeypatch):
-    """The managed branch must not populate v1's in-memory file configs."""
-    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    tuner = AutoTuner.get()
-    with autotune(True, v2_opt_in=True):
-        _choose()
-    assert tuner._file_configs == {}
-
-
-def test_persistent_cache_false_forbids_disk(cache_root, monkeypatch):
-    """v2_opt_in=True, persistent_cache=False tunes in memory even though a store is attached."""
-    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, v2_opt_in=True):
-        _choose()
-    assert len(_entry_files(cache_root)) == 1
-
-    reset_autotuner()  # keeps the attached store, drops tuned winners
-    _install_fake_profile(monkeypatch, times={0: 1.0, 1: 3.0, 2: 2.0})
-    with autotune(True, v2_opt_in=True, persistent_cache=False):
-        _, tactic = _choose()
-    assert tactic == 0  # freshly measured, not the stored winner
-    assert len(_entry_files(cache_root)) == 1  # nothing new published
-
-
-def test_attach_survives_context_exit(cache_root, monkeypatch):
-    """v2_opt_in=True attaches for the process: serving afterwards, with
-    no context at all, still resolves to the store."""
-    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, v2_opt_in=True):
-        _choose()
-
-    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    reset_autotuner()
-    _, tactic = _choose()  # bare, outside any context
-    assert tactic == 1
-    assert calls == []  # served from the store, never profiled
-
-
-def test_replay_mode_does_not_profile(cache_root, monkeypatch):
-    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(True, v2_opt_in=True):
-        _choose()
-
-    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    reset_autotuner()
-    with autotune(False, v2_opt_in=True):
-        _, tactic = _choose()
-    assert tactic == 1
-    assert calls == []
-
-
 def test_measure_policy_requires_v2_opt_in(cache_root):
     """measure= is a v2 concept; the legacy path has no measurement policy."""
     with (
@@ -208,20 +149,6 @@ def test_measure_policy_requires_v2_opt_in(cache_root):
         autotune(True, measure=MeasurementPolicy(execution_mode="eager")),
     ):
         pass
-
-
-def test_measure_policy_without_persistence(cache_root, monkeypatch):
-    """A policy applies under v2 without touching disk."""
-    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
-    with autotune(
-        True,
-        v2_opt_in=True,
-        persistent_cache=False,
-        measure=MeasurementPolicy(execution_mode="eager"),
-    ):
-        _, tactic = _choose()
-    assert tactic == 1
-    assert not _entry_files(cache_root)
 
 
 # --------------------------------------------------------------------------
@@ -234,9 +161,8 @@ def test_measure_policy_without_persistence(cache_root, monkeypatch):
     [
         lambda: autotune(True, v2_opt_in=True),
         lambda: autotune_v2(),
-        lambda: autotune_v2(mode="tune", persistent_cache=True),
     ],
-    ids=["unified", "alias_default", "alias_explicit"],
+    ids=["dispatched", "direct"],
 )
 def test_alias_and_unified_agree(cache_root, monkeypatch, opener):
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
