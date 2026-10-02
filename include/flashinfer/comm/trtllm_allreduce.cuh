@@ -740,6 +740,10 @@ __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReduceParams<T>
   bias_buffer += inner_token_offset;
   weight_buffer += inner_token_offset;
 
+  // With PDL the upstream kernel may still be writing residual/bias/weight, so every
+  // global load of them must come after the grid dependency sync.
+  cudaGridDependencySynchronize();
+
   vec_t<T, VEC_SIZE> weight_vec, bias_vec, residual_vec;
   residual_vec.load(residual_buffer);
   if constexpr (Bias) {
@@ -748,8 +752,6 @@ __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReduceParams<T>
   if constexpr (Affine) {
     weight_vec.load(weight_buffer);
   }
-
-  cudaGridDependencySynchronize();
 
   float acc = 0.f;
   vec_t<T, VEC_SIZE> sum_vec;
